@@ -200,6 +200,8 @@ public class NwfmJobRowProcessor {
      * 判据核验（口径写死，系统不替人定）：
      * 资料不齐（判据版本/金额/器具编号缺）→ 不成；
      * 判据册上压根没有 → 不成；停用 → 已撤；当前时刻落在生效区间外 → 已过期。
+     * 选行口径与判据求值（TNwfmDeviceRuleServiceImpl）同一把尺：
+     * 同编号多版只认在窗启用版，窗口重叠取生效起始最新者，绝不靠 eff_end 排序碰运气。
      */
     private TNwfmDeviceRule resolveRule(TNwfmJob row, Date at) {
         boolean incomplete = isBlank(row.getDeviceNo())
@@ -208,22 +210,47 @@ public class NwfmJobRowProcessor {
         if (incomplete) {
             throw new RuleException("资料不齐：器具编号/金额/判据版本有空缺，按口径本趟不收");
         }
-        TNwfmDeviceRule rule = deviceRuleMapper.selectOne(new QueryWrapper<TNwfmDeviceRule>()
+        List<TNwfmDeviceRule> rows = deviceRuleMapper.selectList(new QueryWrapper<TNwfmDeviceRule>()
                 .eq("rule_code", row.getVersion())
-                .eq("del_flag", 0)
-                .orderByDesc("eff_end").last("limit 1"));
-        if (rule == null) {
+                .eq("del_flag", 0));
+        if (rows.isEmpty()) {
             throw new RuleException("判据状况：册上查不到判据 " + row.getVersion());
         }
-        if (rule.getStatus() != null && rule.getStatus().intValue() == 1) {
-            throw new RuleException("判据状况：判据 " + rule.getRuleCode() + " 已撤下");
+        TNwfmDeviceRule active = null;
+        boolean withdrawnInWindow = false;
+        for (TNwfmDeviceRule r : rows) {
+            boolean inWindow = inEffectWindow(r, at);
+            boolean enabled = r.getStatus() == null || r.getStatus().intValue() != 1;
+            if (enabled && inWindow) {
+                if (active == null || effStartOf(r).after(effStartOf(active))) {
+                    active = r;
+                }
+            } else if (!enabled && inWindow) {
+                withdrawnInWindow = true;
+            }
         }
-        Date start = rule.getEffStart();
-        Date end = rule.getEffEnd();
-        if ((start != null && at.before(start)) || (end != null && !at.before(end))) {
-            throw new RuleException("判据状况：判据 " + rule.getRuleCode() + " 已过期");
+        if (active != null) {
+            return active;
         }
-        return rule;
+        // 窗内只有撤下行 → 已撤；其余（启用的都不在窗等）→ 已过期
+        if (withdrawnInWindow) {
+            throw new RuleException("判据状况：判据 " + row.getVersion() + " 已撤下");
+        }
+        throw new RuleException("判据状况：判据 " + row.getVersion() + " 已过期");
+    }
+
+    /** at 落在 [effStart, effEnd)；两端为空分别视为不限 */
+    private static boolean inEffectWindow(TNwfmDeviceRule r, Date at) {
+        Date start = r.getEffStart();
+        Date end = r.getEffEnd();
+        if (start != null && at.before(start)) {
+            return false;
+        }
+        return end == null || at.before(end);
+    }
+
+    private static Date effStartOf(TNwfmDeviceRule r) {
+        return r.getEffStart() == null ? new Date(Long.MIN_VALUE) : r.getEffStart();
     }
 
     private void trail(String jobNo, Integer rowNo, int stage, String action,

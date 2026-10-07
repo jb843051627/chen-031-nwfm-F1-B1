@@ -121,3 +121,21 @@ VALUES (11, 'V2', '已撤判据', 0.50, 2.00, 5.00, '2020-01-01 00:00:00', '2099
 -- 已过期判据
 INSERT INTO t_nwfm_device_rule (id, rule_code, rule_name, th1_max, th2_max, th3_max, eff_start, eff_end, priority, status, del_flag)
 VALUES (12, 'V3', '过期判据', 0.50, 2.00, 5.00, '2020-01-01 00:00:00', '2021-12-31 23:59:59', 10, 0, 0);
+
+-- 同编号改版两版（V4）：旧版窗口 2020..2023 阈值宽（1/3/8），新版 2024 起阈值严（0.5/2/5）
+INSERT INTO t_nwfm_device_rule (id, rule_code, rule_name, th1_max, th2_max, th3_max, eff_start, eff_end, priority, status, del_flag)
+VALUES (13, 'V4', '旧版口径', 1.00, 3.00, 8.00, '2020-01-01 00:00:00', '2023-12-31 23:59:59', 10, 0, 0);
+INSERT INTO t_nwfm_device_rule (id, rule_code, rule_name, th1_max, th2_max, th3_max, eff_start, eff_end, priority, status, del_flag)
+VALUES (14, 'V4', '新版口径', 0.50, 2.00, 5.00, '2024-01-01 00:00:00', '2099-12-31 23:59:59', 10, 0, 0);
+
+-- 高优先级口径：只在 2030..2035 窗口内可用，阈值最严（0.01/0.02/0.05）
+INSERT INTO t_nwfm_device_rule (id, rule_code, rule_name, th1_max, th2_max, th3_max, eff_start, eff_end, priority, status, del_flag)
+VALUES (15, 'VP', '高优先级口径', 0.01, 0.02, 0.05, '2030-01-01 00:00:00', '2035-12-31 23:59:59', 20, 0, 0);
+
+-- 与 V1 同优先级、编号按字典序更大的口径（验并列时确定性取号），阈值 0.10/0.40/1.00
+INSERT INTO t_nwfm_device_rule (id, rule_code, rule_name, th1_max, th2_max, th3_max, eff_start, eff_end, priority, status, del_flag)
+VALUES (16, 'VW', '同优先级并列口径', 0.10, 0.40, 1.00, '2020-01-01 00:00:00', '2099-12-31 23:59:59', 10, 0, 0);
+
+-- 已撤下的改版口径：窗口虽罩住当下，status=1 不许参与判档
+INSERT INTO t_nwfm_device_rule (id, rule_code, rule_name, th1_max, th2_max, th3_max, eff_start, eff_end, priority, status, del_flag)
+VALUES (17, 'V4', '改版后撤下的口径', 0.20, 0.30, 0.40, '2024-01-01 00:00:00', '2099-12-31 23:59:59', 99, 1, 0);

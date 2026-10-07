@@ -19,6 +19,7 @@ import com.baomidou.mybatisplus.core.handlers.MetaObjectHandler;
 import com.baomidou.mybatisplus.extension.spring.MybatisSqlSessionFactoryBean;
 import com.fc.v2.mapper.custom.NwfmJobLockDao;
 import com.fc.v2.service.impl.NwfmJobRowProcessor;
+import com.fc.v2.service.impl.TNwfmDeviceRuleServiceImpl;
 import com.fc.v2.service.impl.TNwfmJobServiceImpl;
 
 import org.apache.ibatis.reflection.MetaObject;
@@ -94,5 +95,10 @@ public class NwfmJobTestConfig {
     @Bean
     public TNwfmJobServiceImpl jobService() {
         return new TNwfmJobServiceImpl();
+    }
+
+    @Bean
+    public TNwfmDeviceRuleServiceImpl deviceRuleService() {
+        return new TNwfmDeviceRuleServiceImpl();
     }
 }

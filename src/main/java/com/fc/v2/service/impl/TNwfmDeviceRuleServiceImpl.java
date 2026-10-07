@@ -21,7 +21,10 @@ import com.fc.v2.service.ITNwfmDeviceRuleService;
 @Service
 public class TNwfmDeviceRuleServiceImpl implements ITNwfmDeviceRuleService {
 
-    /** 优先级降序；并列按 ruleCode 降序（确定性） */
+    /** 示值偏差(%)合法区间：不接受负值，超过 100% 视为离谱值，一律拦在门外不判档 */
+    private static final BigDecimal MAX_INPUT = new BigDecimal("100");
+
+    /** 优先级降序；并列按 ruleCode 降序、再按 id 降序（确定性，不靠库返回顺序） */
     private static final Comparator<TNwfmDeviceRule> PRIORITY_THEN_CODE_DESC = new Comparator<TNwfmDeviceRule>() {
         @Override
         public int compare(TNwfmDeviceRule a, TNwfmDeviceRule b) {
@@ -32,21 +35,18 @@ public class TNwfmDeviceRuleServiceImpl implements ITNwfmDeviceRuleService {
             }
             String ca = a.getRuleCode() == null ? "" : a.getRuleCode();
             String cb = b.getRuleCode() == null ? "" : b.getRuleCode();
-            return cb.compareTo(ca);
+            int byCode = cb.compareTo(ca);
+            if (byCode != 0) {
+                return byCode;
+            }
+            long ia = a.getId() == null ? 0L : a.getId().longValue();
+            long ib = b.getId() == null ? 0L : b.getId().longValue();
+            return Long.compare(ib, ia);
         }
     };
 
     @javax.annotation.Resource
     private TNwfmDeviceRuleMapper nwfmDeviceRuleMapper;
-
-    /**
-     * 时段比较统一走**墙钟字符串**（yyyy-MM-dd HH:mm:ss）+ 字符串绑定：
-     * JDBC 的 serverTimezone 与本机时区不对称，直接把 java.util.Date 作参数会整体偏移，
-     * 使边界判定在"切换当日"这类用例上随机错档（实测踩到）。
-     */
-    private static String ts(Date d) {
-        return new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(d);
-    }
 
     @Override
     public TNwfmDeviceRule selectTNwfmDeviceRuleById(Long id) {
@@ -58,7 +58,18 @@ public class TNwfmDeviceRuleServiceImpl implements ITNwfmDeviceRuleService {
         if (at == null) {
             return new java.util.ArrayList<TNwfmDeviceRule>();
         }
-        return this.nwfmDeviceRuleMapper.selectList(new QueryWrapper<TNwfmDeviceRule>().eq("del_flag", 0));
+        // 窗口在 Java 侧判，不把 java.util.Date 绑进 SQL（JDBC serverTimezone 与本机
+        // 时区不对称，绑定参数会整体偏移，切换当日边界会随机错档）；先在库上拦 启用/未删
+        List<TNwfmDeviceRule> all = this.nwfmDeviceRuleMapper.selectList(
+                new QueryWrapper<TNwfmDeviceRule>().eq("del_flag", 0).eq("status", 0));
+        List<TNwfmDeviceRule> avail = new java.util.ArrayList<TNwfmDeviceRule>();
+        for (TNwfmDeviceRule r : all) {
+            if (inWindow(r, at)) {
+                avail.add(r);
+            }
+        }
+        java.util.Collections.sort(avail, PRIORITY_THEN_CODE_DESC);
+        return avail;
     }
 
     @Override
@@ -66,7 +77,15 @@ public class TNwfmDeviceRuleServiceImpl implements ITNwfmDeviceRuleService {
         if (ruleCode == null || ruleCode.trim().isEmpty() || input == null || at == null) {
             return 0;
         }
+        // 负数偏差、离谱偏差本就不该进门，不替它秤出任何档
+        if (!inputValid(input)) {
+            return 0;
+        }
         TNwfmDeviceRule rule = findRule(ruleCode, at);
+        if (rule == null) {
+            // 册上没有这版口径（含已撤下/已过期）：没依据，不判档
+            return 0;
+        }
         return levelOf(rule, input);
     }
 
@@ -75,14 +94,14 @@ public class TNwfmDeviceRuleServiceImpl implements ITNwfmDeviceRuleService {
         if (input == null || at == null) {
             return 0;
         }
-        if (input.compareTo(BigDecimal.ZERO) < 0
-                || input.compareTo(new BigDecimal("100")) > 0) {
+        if (!inputValid(input)) {
             return 0;
         }
         List<TNwfmDeviceRule> avail = listAvailable(at);
         if (avail.isEmpty()) {
             return 0;
         }
+        // listAvailable 已按优先级降序排定，头一条就是册上标得最高的口径
         return levelOf(avail.get(0), input);
     }
 
@@ -92,7 +111,7 @@ public class TNwfmDeviceRuleServiceImpl implements ITNwfmDeviceRuleService {
             return false;
         }
         TNwfmDeviceRule r = this.nwfmDeviceRuleMapper.selectById(id);
-        return r != null;
+        return isAvailable(r, at);
     }
 
     @Override
@@ -100,38 +119,62 @@ public class TNwfmDeviceRuleServiceImpl implements ITNwfmDeviceRuleService {
         if (at == null) {
             return 0;
         }
-        return this.nwfmDeviceRuleMapper
-                .selectList(new QueryWrapper<TNwfmDeviceRule>().eq("del_flag", 0)).size();
+        return listAvailable(at).size();
     }
 
+    /**
+     * 按 ruleCode 定位 at 时刻生效的那版口径：未删、启用、且 at 落在其生效窗口内。
+     * 改版即新版一行新窗口，复秤旧账传旧时刻仍取到旧版，处置不会随改版漂。
+     * 同一编号窗口理论上不重叠；万一重叠，取生效起始最新的一版（确定性，不靠库返回顺序）。
+     */
     private TNwfmDeviceRule findRule(String ruleCode, Date at) {
         List<TNwfmDeviceRule> hit = this.nwfmDeviceRuleMapper.selectList(new QueryWrapper<TNwfmDeviceRule>()
-                .eq("del_flag", 0).eq("rule_code", ruleCode));
-        TNwfmDeviceRule newest = null;
+                .eq("del_flag", 0).eq("status", 0).eq("rule_code", ruleCode));
+        TNwfmDeviceRule picked = null;
         for (TNwfmDeviceRule r : hit) {
-            if (newest == null || r.getEffEnd() == null) {
-                newest = r;
-            } else if (newest.getEffEnd() != null && r.getEffEnd().after(newest.getEffEnd())) {
-                newest = r;
+            if (!inWindow(r, at)) {
+                continue;
+            }
+            if (picked == null || effStartOf(r).after(effStartOf(picked))) {
+                picked = r;
             }
         }
-        return newest;
+        return picked;
     }
 
-    /** 阈值解析：档案为主、明细覆盖；两者皆缺返回 null（调用方按不可用处理），精度统一 2 位 */
-    private BigDecimal resolveLimit(TNwfmDeviceRule r, int tier) {
-        if (tier == 1) {
-            return r.getTh1Max();
+    /** 口径在 at 时刻可用：未删、启用（撤下开关必须真生效）、在生效窗口内（起含止不含） */
+    private boolean isAvailable(TNwfmDeviceRule r, Date at) {
+        if (r == null || at == null) {
+            return false;
         }
-        if (tier == 2) {
-            return r.getTh2Max();
+        if (r.getDelFlag() != null && r.getDelFlag().intValue() != 0) {
+            return false;
         }
-        return r.getTh3Max();
+        if (r.getStatus() != null && r.getStatus().intValue() != 0) {
+            return false;
+        }
+        return inWindow(r, at);
     }
 
-    /** 档案级默认阈值（明细未维护时的回退来源） */
-    private BigDecimal defaultThreshold(TNwfmDeviceRule r, int tier) {
-        return r.getTh1Max();
+    /** at 落在 [effStart, effEnd)；两端为空分别视为不限 */
+    private boolean inWindow(TNwfmDeviceRule r, Date at) {
+        Date start = r.getEffStart();
+        Date end = r.getEffEnd();
+        if (start != null && at.before(start)) {
+            return false;
+        }
+        if (end != null && !at.before(end)) {
+            return false;
+        }
+        return true;
+    }
+
+    private static Date effStartOf(TNwfmDeviceRule r) {
+        return r.getEffStart() == null ? new Date(Long.MIN_VALUE) : r.getEffStart();
+    }
+
+    private static boolean inputValid(BigDecimal input) {
+        return input.signum() >= 0 && input.compareTo(MAX_INPUT) <= 0;
     }
 
     /** 分档：等于上限取高一档 */
