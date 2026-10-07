@@ -199,7 +199,10 @@ public class NwfmJobRowProcessor {
     /**
      * 判据核验（口径写死，系统不替人定）：
      * 资料不齐（判据版本/金额/器具编号缺）→ 不成；
-     * 判据册上压根没有 → 不成；停用 → 已撤；当前时刻落在生效区间外 → 已过期。
+     * 判据册上压根没有 → 不成；at 时刻在区间内但停用 → 已撤；当前时刻落在生效区间外 → 已过期。
+     *
+     * 同一编号改版是时段不同的多行，只认 [eff_start, eff_end) 罩得住本趟时刻的那一版，
+     * 不能按“截止时刻最晚”抓到撤下行或未来版上；区间重叠的脏档按新录入（id 大）决胜。
      */
     private TNwfmDeviceRule resolveRule(TNwfmJob row, Date at) {
         boolean incomplete = isBlank(row.getDeviceNo())
@@ -208,22 +211,61 @@ public class NwfmJobRowProcessor {
         if (incomplete) {
             throw new RuleException("资料不齐：器具编号/金额/判据版本有空缺，按口径本趟不收");
         }
-        TNwfmDeviceRule rule = deviceRuleMapper.selectOne(new QueryWrapper<TNwfmDeviceRule>()
-                .eq("rule_code", row.getVersion())
-                .eq("del_flag", 0)
-                .orderByDesc("eff_end").last("limit 1"));
-        if (rule == null) {
+        List<TNwfmDeviceRule> versions = deviceRuleMapper.selectList(
+                new QueryWrapper<TNwfmDeviceRule>()
+                        .eq("rule_code", row.getVersion()).eq("del_flag", 0));
+        if (versions.isEmpty()) {
             throw new RuleException("判据状况：册上查不到判据 " + row.getVersion());
         }
-        if (rule.getStatus() != null && rule.getStatus().intValue() == 1) {
-            throw new RuleException("判据状况：判据 " + rule.getRuleCode() + " 已撤下");
+
+        // 先挑本趟时刻被生效区间罩住的版本
+        TNwfmDeviceRule coveringEnabled = null;
+        TNwfmDeviceRule coveringWithdrawn = null;
+        for (TNwfmDeviceRule r : versions) {
+            if (!inEffect(r, at)) {
+                continue;
+            }
+            boolean withdrawn = r.getStatus() != null && r.getStatus().intValue() == 1;
+            if (withdrawn) {
+                if (coveringWithdrawn == null || newer(r, coveringWithdrawn)) {
+                    coveringWithdrawn = r;
+                }
+            } else if (coveringEnabled == null || newer(r, coveringEnabled)) {
+                coveringEnabled = r;
+            }
         }
-        Date start = rule.getEffStart();
-        Date end = rule.getEffEnd();
-        if ((start != null && at.before(start)) || (end != null && !at.before(end))) {
-            throw new RuleException("判据状况：判据 " + rule.getRuleCode() + " 已过期");
+        if (coveringEnabled != null) {
+            return coveringEnabled;
         }
-        return rule;
+        if (coveringWithdrawn != null) {
+            throw new RuleException("判据状况：判据 " + coveringWithdrawn.getRuleCode() + " 已撤下");
+        }
+
+        // at 时刻没有任何版本生效：看最新一版是撤了还是过期了，给个明白说法
+        TNwfmDeviceRule newest = null;
+        for (TNwfmDeviceRule r : versions) {
+            if (newest == null || newer(r, newest)) {
+                newest = r;
+            }
+        }
+        if (newest.getStatus() != null && newest.getStatus().intValue() == 1) {
+            throw new RuleException("判据状况：判据 " + newest.getRuleCode() + " 已撤下");
+        }
+        throw new RuleException("判据状况：判据 " + newest.getRuleCode() + " 已过期");
+    }
+
+    /** at 是否落在版本生效区间 [eff_start, eff_end) 内；端点留空表示该侧不限 */
+    private static boolean inEffect(TNwfmDeviceRule r, Date at) {
+        Date start = r.getEffStart();
+        Date end = r.getEffEnd();
+        return (start == null || !at.before(start)) && (end == null || at.before(end));
+    }
+
+    /** 同编号多版的决胜：新录入的行（id 大）算新 */
+    private static boolean newer(TNwfmDeviceRule a, TNwfmDeviceRule b) {
+        long ia = a.getId() == null ? 0L : a.getId().longValue();
+        long ib = b.getId() == null ? 0L : b.getId().longValue();
+        return ia > ib;
     }
 
     private void trail(String jobNo, Integer rowNo, int stage, String action,
